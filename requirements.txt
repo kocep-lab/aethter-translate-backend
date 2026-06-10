@@ -1,0 +1,6 @@
+Flask>=3.0.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+pypinyin>=0.50.0
+jieba>=0.42.1
+chinese-english-lookup>=0.0.3

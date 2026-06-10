@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+env/
+venv/
+ENV/
+*.log
+test_client_batch_translation.py
+find_git.py
+test_dictionary.py
