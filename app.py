@@ -794,6 +794,69 @@ def translate_batch_api():
     except Exception as e:
         return jsonify({"error": f"Batch translation failed: {str(e)}"}), 500
 
+@app.route('/api/annotate', methods=['POST', 'OPTIONS'])
+def annotate_api():
+    """API endpoint for annotating pre-translated Chinese text with Pinyin and Dictionary tooltips."""
+    if request.method == 'OPTIONS':
+        return '', 200
+        
+    data = request.get_json() or {}
+    translated_text = data.get("translated_text", "")
+    
+    if not translated_text.strip():
+        return jsonify({"error": "Empty translated text"}), 400
+        
+    try:
+        structured = process_translation(translated_text)
+        return jsonify({
+            "translated_text": translated_text,
+            "structured_translation": structured
+        })
+    except Exception as e:
+        return jsonify({"error": f"Annotation failed: {str(e)}"}), 500
+
+@app.route('/api/annotate_batch', methods=['POST', 'OPTIONS'])
+def annotate_batch_api():
+    """API endpoint for annotating a batch of pre-translated Chinese texts."""
+    if request.method == 'OPTIONS':
+        return '', 200
+        
+    data = request.get_json() or {}
+    translated_texts = data.get("translated_texts", [])
+    original_texts = data.get("original_texts", [])
+    
+    if not translated_texts:
+        return jsonify({"error": "Empty translated texts list"}), 400
+        
+    try:
+        # Aggregate unique Chinese words
+        unique_words = set()
+        for trans_text, orig_text in zip(translated_texts, original_texts):
+            if trans_text.strip() and trans_text != orig_text:
+                for w in jieba.cut(trans_text):
+                    if w.strip() and re.search(r'[\u4e00-\u9fff]', w):
+                        unique_words.add(w)
+                        
+        # Translate the global set of unique words in batch (mostly using local offline dict)
+        unique_words_list = list(unique_words)
+        translated_words = translate_zh_to_en_batch(unique_words_list)
+        translation_dict = dict(zip(unique_words_list, translated_words))
+        
+        def process_item(item):
+            translated_text, original_text = item
+            if not translated_text.strip() or translated_text == original_text:
+                return []
+            return process_translation_with_dict(translated_text, translation_dict)
+            
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            structured_results = list(executor.map(process_item, zip(translated_texts, original_texts)))
+            
+        return jsonify({
+            "results": structured_results
+        })
+    except Exception as e:
+        return jsonify({"error": f"Batch annotation failed: {str(e)}"}), 500
+
 # Enable CORS for Chrome Extension requests
 @app.after_request
 def add_cors_headers(response):
