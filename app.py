@@ -802,6 +802,52 @@ def add_cors_headers(response):
     response.headers["Access-Control-Allow-Methods"] = "POST, GET, OPTIONS"
     return response
 
+@app.route('/api/test_apis')
+def test_apis():
+    import requests
+    results = {}
+    
+    # 1. Google AT
+    try:
+        url = "https://translate.google.com/translate_a/single"
+        params = {"client": "at", "sl": "en", "tl": "zh-CN", "dt": "t"}
+        data = {"q": "Hello world"}
+        res = requests.post(url, params=params, data=data, headers=HEADERS, timeout=3)
+        results["google_at"] = {"status": res.status_code, "text": res.text[:200]}
+    except Exception as e:
+        results["google_at"] = {"error": str(e)}
+        
+    # 2. Google GTX
+    try:
+        url = "https://translate.google.com/translate_a/single"
+        params = {"client": "gtx", "sl": "en", "tl": "zh-CN", "dt": "t"}
+        data = {"q": "Hello world"}
+        res = requests.post(url, params=params, data=data, timeout=3)
+        results["google_gtx"] = {"status": res.status_code, "text": res.text[:200]}
+    except Exception as e:
+        results["google_gtx"] = {"error": str(e)}
+        
+    # 3. Lingva
+    try:
+        from urllib.parse import quote
+        lingva_url = f"https://lingva.ml/api/v1/en/zh/{quote('Hello world')}"
+        res = requests.get(lingva_url, timeout=3)
+        results["lingva"] = {"status": res.status_code, "text": res.text[:200]}
+    except Exception as e:
+        results["lingva"] = {"error": str(e)}
+        
+    # 4. MyMemory
+    try:
+        mm_url = "https://api.mymemory.translated.net/get"
+        mm_params = {"q": "Hello world", "langpair": "en|zh-CN", "de": "aethertranslate_test@example.com"}
+        res = requests.get(mm_url, params=mm_params, timeout=3)
+        results["mymemory"] = {"status": res.status_code, "text": res.text[:200]}
+    except Exception as e:
+        results["mymemory"] = {"error": str(e)}
+        
+    return jsonify(results)
+
 # Run server
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
+
