@@ -250,31 +250,39 @@ def translate_zh_to_en_batch_external(words):
 
         # 4. Try MyMemory
         if not translated_payload and not mymemory_blocked:
-            mm_results = []
-            for i, w in enumerate(chunk):
+            def translate_single_word(args_inner):
+                idx_inner, w_inner = args_inner
                 if globals()['mymemory_blocked']:
-                    mm_results.append(f"[{i}] {w}")
-                    continue
+                    return idx_inner, w_inner
                 try:
                     mm_url = "https://api.mymemory.translated.net/get"
                     mm_params = {
-                        "q": w,
+                        "q": w_inner,
                         "langpair": "zh-CN|en",
                         "de": "aethertranslate_test@example.com"
                     }
                     res = requests.get(mm_url, params=mm_params, timeout=1.5)
                     if res.status_code == 429 or (res.status_code == 200 and "MYMEMORY WARNING" in res.text):
                         globals()['mymemory_blocked'] = True
-                        mm_results.append(f"[{i}] {w}")
+                        return idx_inner, w_inner
                     elif res.status_code == 200:
                         val = res.json()["responseData"]["translatedText"]
                         if val and not val.startswith("MYMEMORY WARNING"):
-                            mm_results.append(f"[{i}] {val}")
+                            return idx_inner, val
                         else:
-                            mm_results.append(f"[{i}] {w}")
+                            return idx_inner, w_inner
                 except Exception:
-                    mm_results.append(f"[{i}] {w}")
-            translated_payload = "\n".join(mm_results)
+                    pass
+                return idx_inner, w_inner
+
+            mm_results_indexed = [None] * len(chunk)
+            with ThreadPoolExecutor(max_workers=8) as mm_executor:
+                mm_completed = list(mm_executor.map(translate_single_word, enumerate(chunk)))
+            
+            for idx_inner, val_inner in mm_completed:
+                mm_results_indexed[idx_inner] = f"[{idx_inner}] {val_inner}"
+                
+            translated_payload = "\n".join(mm_results_indexed)
             
         # Parse translated payload
         chunk_results = [None] * len(chunk)
@@ -420,7 +428,7 @@ def process_translation_with_dict(chinese_text, translation_dict):
 
 def translate_list(texts):
     """
-    Translates a list of texts sequentially in batches of 15 using client=at,
+    Translates a list of texts in parallel in batches of 15 using client=at,
     falling back to client=gtx, Lingva Translate (pipe-batch), and MyMemory if needed.
     """
     global google_at_blocked, google_gtx_blocked, lingva_blocked, mymemory_blocked
@@ -429,8 +437,14 @@ def translate_list(texts):
     results = [None] * len(texts)
     batch_size = 15
     
+    chunks = []
+    chunk_starts = []
     for start_idx in range(0, len(texts), batch_size):
-        chunk = texts[start_idx : start_idx + batch_size]
+        chunks.append(texts[start_idx : start_idx + batch_size])
+        chunk_starts.append(start_idx)
+        
+    def translate_single_chunk(args):
+        start_idx, chunk = args
         prefixed_items = [f"[{i}] {text.strip().replace('\n', ' ')}" for i, text in enumerate(chunk)]
         payload = "\n".join(prefixed_items)
         
@@ -452,7 +466,7 @@ def translate_list(texts):
                 if response.status_code == 200:
                     translated_payload = parse_batch_to_string(response.json())
                 elif response.status_code == 429:
-                    google_at_blocked = True
+                    globals()['google_at_blocked'] = True
             except Exception:
                 pass
             
@@ -473,7 +487,7 @@ def translate_list(texts):
                 if response.status_code == 200:
                     translated_payload = parse_batch_to_string(response.json())
                 elif response.status_code == 429:
-                    google_gtx_blocked = True
+                    globals()['google_gtx_blocked'] = True
             except Exception:
                 pass
 
@@ -490,16 +504,16 @@ def translate_list(texts):
                         # Replace both standard and Chinese full-width pipes with newlines for standard parsing
                         translated_payload = val.replace("|", "\n").replace("｜", "\n")
                 elif response.status_code == 429:
-                    lingva_blocked = True
+                    globals()['lingva_blocked'] = True
             except Exception:
                 pass
                 
         # 4. Fallback to MyMemory in parallel
         if not translated_payload and not mymemory_blocked:
-            print("Google Translate and Lingva rate-limited. Falling back to MyMemory...", file=sys.stderr)
             translated_payload = translate_chunk_mymemory(chunk)
             
         # Parse output and map back to indices
+        chunk_results = [None] * len(chunk)
         if translated_payload:
             lines = translated_payload.split("\n")
             for line in lines:
@@ -508,10 +522,21 @@ def translate_list(texts):
                 if match:
                     idx = int(match.group(1))
                     val = match.group(2).strip()
-                    global_idx = start_idx + idx
-                    if global_idx < len(results):
-                        results[global_idx] = val
+                    if idx < len(chunk_results):
+                        chunk_results[idx] = val
                         
+        return start_idx, chunk_results
+
+    # Run all chunks in parallel
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        completed = list(executor.map(translate_single_chunk, zip(chunk_starts, chunks)))
+        
+    for start_idx, chunk_results in completed:
+        for idx, val in enumerate(chunk_results):
+            global_idx = start_idx + idx
+            if global_idx < len(results):
+                results[global_idx] = val
+                
     # Fallback to original text for any failures
     for i in range(len(results)):
         if results[i] is None:
