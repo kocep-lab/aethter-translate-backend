@@ -10,3 +10,4 @@ ENV/
 test_client_batch_translation.py
 find_git.py
 test_dictionary.py
+translation_cache.db

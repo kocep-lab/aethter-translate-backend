@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import html
+import sqlite3
 import requests
 from flask import Flask, request, jsonify, render_template
 from bs4 import BeautifulSoup, Comment, NavigableString
@@ -15,6 +16,60 @@ from chinese_english_lookup import Dictionary
 print("Loading offline CC-CEDICT dictionary...", flush=True)
 offline_dict = Dictionary()
 print("Offline dictionary loaded successfully.", flush=True)
+
+# Initialize SQLite Cache Database
+def init_db():
+    try:
+        conn = sqlite3.connect("translation_cache.db", timeout=15)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS translations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_text TEXT UNIQUE,
+                target_text TEXT,
+                lang_pair TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+        conn.close()
+        print("SQLite translation cache database initialized successfully.", flush=True)
+    except Exception as e:
+        print(f"Error initializing SQLite cache: {e}", file=sys.stderr)
+
+init_db()
+
+def get_cached_translations(texts, lang_pair="en-zh"):
+    if not texts:
+        return {}
+    cached_map = {}
+    try:
+        conn = sqlite3.connect("translation_cache.db", timeout=15)
+        cursor = conn.cursor()
+        placeholders = ",".join(["?"] * len(texts))
+        cursor.execute(
+            f"SELECT source_text, target_text FROM translations WHERE lang_pair = ? AND source_text IN ({placeholders})",
+            [lang_pair] + list(texts)
+        )
+        for row in cursor.fetchall():
+            cached_map[row[0]] = row[1]
+        conn.close()
+    except Exception as e:
+        print(f"Error reading cache: {e}", file=sys.stderr)
+    return cached_map
+
+def save_translations_batch(translations_dict, lang_pair="en-zh"):
+    if not translations_dict:
+        return
+    try:
+        conn = sqlite3.connect("translation_cache.db", timeout=15)
+        cursor = conn.cursor()
+        data = [(src, tgt, lang_pair) for src, tgt in translations_dict.items() if src and tgt]
+        cursor.executemany("INSERT OR IGNORE INTO translations (source_text, target_text, lang_pair) VALUES (?, ?, ?)", data)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error saving to cache: {e}", file=sys.stderr)
 
 # Initialize Flask App
 app = Flask(__name__, template_folder='templates', static_folder='static')
@@ -43,6 +98,26 @@ def check_reset_circuit_breakers():
         LAST_RESET_TIME = now
 
 def translate_en_to_zh(text):
+    global google_at_blocked, google_gtx_blocked, lingva_blocked, mymemory_blocked
+    check_reset_circuit_breakers()
+    
+    if not text.strip():
+        return ""
+        
+    # Check cache first
+    cached = get_cached_translations([text])
+    if text in cached:
+        return cached[text]
+        
+    translated = translate_en_to_zh_uncached(text)
+    
+    # Save to cache if translation succeeded
+    if text.strip() and translated.strip() and text != translated:
+        save_translations_batch({text: translated})
+        
+    return translated
+
+def translate_en_to_zh_uncached(text):
     """
     Translates English text to Simplified Chinese using the free Google Translate API.
     Supports client fallback (at -> gtx) and MyMemory fallback.
@@ -620,7 +695,7 @@ def translate_list_google_cloud(texts, api_key):
 def translate_list(texts):
     """
     Translates a list of texts. If GOOGLE_TRANSLATE_API_KEY is available, uses the official API first.
-    Falls back to scraping for any missing or failed items.
+    Falls back to scraping for any missing or failed items. Uses SQLite cache to avoid redundant calls.
     """
     global google_at_blocked, google_gtx_blocked, lingva_blocked, mymemory_blocked
     check_reset_circuit_breakers()
@@ -628,24 +703,55 @@ def translate_list(texts):
     if not texts:
         return []
 
-    api_key = os.environ.get("GOOGLE_TRANSLATE_API_KEY")
+    # 1. Check SQLite Cache
+    cached_map = get_cached_translations(texts)
+    
     results = [None] * len(texts)
+    missed_indices = []
+    missed_texts = []
+    
+    for i, t in enumerate(texts):
+        if t in cached_map:
+            results[i] = cached_map[t]
+        else:
+            missed_indices.append(i)
+            missed_texts.append(t)
+            
+    if not missed_texts:
+        return results
+
+    # 2. Translate only missing texts
+    api_key = os.environ.get("GOOGLE_TRANSLATE_API_KEY")
+    missed_results = [None] * len(missed_texts)
 
     if api_key:
-        results = translate_list_google_cloud(texts, api_key)
+        missed_results = translate_list_google_cloud(missed_texts, api_key)
 
     # Fallback to scraping for any failed or missing items
-    missed_indices = [i for i, r in enumerate(results) if r is None]
-    if missed_indices:
-        missed_texts = [texts[i] for i in missed_indices]
-        fallback_results = translate_list_fallback(missed_texts)
-        for idx, f_res in zip(missed_indices, fallback_results):
-            results[idx] = f_res
+    fallback_indices = [i for i, r in enumerate(missed_results) if r is None]
+    if fallback_indices:
+        fallback_texts = [missed_texts[i] for i in fallback_indices]
+        fallback_results = translate_list_fallback(fallback_texts)
+        for idx, f_res in zip(fallback_indices, fallback_results):
+            missed_results[idx] = f_res
 
     # Fallback to original text for any remaining failures
-    for i in range(len(results)):
-        if results[i] is None:
-            results[i] = texts[i]
+    for i in range(len(missed_results)):
+        if missed_results[i] is None:
+            missed_results[i] = missed_texts[i]
+
+    # 3. Save new translations to SQLite Cache
+    new_translations = {}
+    for text, translated in zip(missed_texts, missed_results):
+        if text.strip() and translated.strip() and text != translated:
+            new_translations[text] = translated
+            
+    if new_translations:
+        save_translations_batch(new_translations)
+
+    # 4. Merge results
+    for idx, res in zip(missed_indices, missed_results):
+        results[idx] = res
 
     return results
 
