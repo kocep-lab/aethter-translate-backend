@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import html
 import requests
 from flask import Flask, request, jsonify, render_template
 from bs4 import BeautifulSoup, Comment, NavigableString
@@ -51,6 +52,31 @@ def translate_en_to_zh(text):
     
     if not text.strip():
         return ""
+        
+    # Try Google Cloud Translation API if configured
+    api_key = os.environ.get("GOOGLE_TRANSLATE_API_KEY")
+    if api_key:
+        url = "https://translation.googleapis.com/language/translate/v2"
+        params = {"key": api_key}
+        headers = {"Content-Type": "application/json; charset=utf-8"}
+        payload = {
+            "q": [text],
+            "target": "zh-CN",
+            "source": "en",
+            "format": "text"
+        }
+        try:
+            response = requests.post(url, params=params, json=payload, headers=headers, timeout=5)
+            if response.status_code == 200:
+                res_data = response.json()
+                translations = res_data.get("data", {}).get("translations", [])
+                if translations:
+                    translated_val = translations[0].get("translatedText", "")
+                    return html.unescape(translated_val)
+            else:
+                print(f"Google Cloud Translation API error in single translation: {response.status_code} - {response.text}", file=sys.stderr)
+        except Exception as e:
+            print(f"Google Cloud Translation API exception in single translation: {str(e)}", file=sys.stderr)
     
     url = "https://translate.google.com/translate_a/single"
     params = {
@@ -168,10 +194,78 @@ def translate_zh_to_en_batch(words):
             
     return final_results
 
+def translate_zh_to_en_batch_google_cloud(words, api_key):
+    """
+    Translates a list of Chinese words/phrases to English using the official Google Cloud Translation v2 API.
+    """
+    if not words:
+        return []
+        
+    results = [None] * len(words)
+    batch_size = 100
+    
+    chunks = []
+    chunk_starts = []
+    for start_idx in range(0, len(words), batch_size):
+        chunks.append(words[start_idx : start_idx + batch_size])
+        chunk_starts.append(start_idx)
+        
+    def translate_chunk_api(args):
+        start_idx, chunk = args
+        chunk_results = [None] * len(chunk)
+        to_translate_indices = []
+        to_translate_texts = []
+        for i, text in enumerate(chunk):
+            cleaned = text.strip()
+            if cleaned and re.search(r'[\u4e00-\u9fff]', cleaned):
+                to_translate_indices.append(i)
+                to_translate_texts.append(cleaned)
+            else:
+                chunk_results[i] = ""
+                
+        if not to_translate_texts:
+            return start_idx, chunk_results
+            
+        url = "https://translation.googleapis.com/language/translate/v2"
+        params = {"key": api_key}
+        headers = {"Content-Type": "application/json; charset=utf-8"}
+        payload = {
+            "q": to_translate_texts,
+            "target": "en",
+            "source": "zh-CN",
+            "format": "text"
+        }
+        try:
+            response = requests.post(url, params=params, json=payload, headers=headers, timeout=10)
+            if response.status_code == 200:
+                res_data = response.json()
+                translations = res_data.get("data", {}).get("translations", [])
+                for idx, t_idx in enumerate(to_translate_indices):
+                    if idx < len(translations):
+                        translated_val = translations[idx].get("translatedText", "")
+                        chunk_results[t_idx] = html.unescape(translated_val)
+            else:
+                print(f"Google Cloud Translation API error (zh->en): {response.status_code} - {response.text}", file=sys.stderr)
+        except Exception as e:
+            print(f"Google Cloud Translation API exception (zh->en): {str(e)}", file=sys.stderr)
+            
+        return start_idx, chunk_results
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        completed = list(executor.map(translate_chunk_api, zip(chunk_starts, chunks)))
+        
+    for start_idx, chunk_results in completed:
+        for idx, val in enumerate(chunk_results):
+            global_idx = start_idx + idx
+            if global_idx < len(results):
+                results[global_idx] = val
+                
+    return results
+
 def translate_zh_to_en_batch_external(words):
     """
     Translates a list of Chinese words/phrases to English in chunks of 15
-    in parallel using ThreadPoolExecutor.
+    in parallel. If GOOGLE_TRANSLATE_API_KEY is available, uses official API first.
     """
     global google_at_blocked, google_gtx_blocked, lingva_blocked, mymemory_blocked
     check_reset_circuit_breakers()
@@ -179,6 +273,34 @@ def translate_zh_to_en_batch_external(words):
     if not words:
         return []
         
+    api_key = os.environ.get("GOOGLE_TRANSLATE_API_KEY")
+    results = [None] * len(words)
+    
+    if api_key:
+        results = translate_zh_to_en_batch_google_cloud(words, api_key)
+        
+    # Check if we need fallbacks for any failed or missing items
+    missed_indices = [i for i, r in enumerate(results) if r is None]
+    if missed_indices:
+        missed_words = [words[i] for i in missed_indices]
+        fallback_results = translate_zh_to_en_batch_external_fallback(missed_words)
+        for idx, f_res in zip(missed_indices, fallback_results):
+            results[idx] = f_res
+            
+    # Fill defaults
+    for i in range(len(results)):
+        if results[i] is None:
+            results[i] = ""
+            
+    return results
+
+def translate_zh_to_en_batch_external_fallback(words):
+    """
+    Translates a list of Chinese words/phrases to English in chunks of 15
+    in parallel using ThreadPoolExecutor (fallback scraping).
+    """
+    global google_at_blocked, google_gtx_blocked, lingva_blocked, mymemory_blocked
+    
     clean_words = []
     word_indices = []
     for i, w in enumerate(words):
@@ -426,13 +548,113 @@ def process_translation_with_dict(chinese_text, translation_dict):
 
 # --- Website Translation Proxy Helpers ---
 
+def translate_list_google_cloud(texts, api_key):
+    """
+    Translates a list of texts using the official Google Cloud Translation v2 API.
+    Handles batching (up to 100 texts per request).
+    """
+    if not texts:
+        return []
+        
+    results = [None] * len(texts)
+    batch_size = 100
+    
+    chunks = []
+    chunk_starts = []
+    for start_idx in range(0, len(texts), batch_size):
+        chunks.append(texts[start_idx : start_idx + batch_size])
+        chunk_starts.append(start_idx)
+        
+    def translate_chunk_api(args):
+        start_idx, chunk = args
+        chunk_results = [None] * len(chunk)
+        to_translate_indices = []
+        to_translate_texts = []
+        for i, text in enumerate(chunk):
+            cleaned = text.strip()
+            if cleaned and re.search(r'[a-zA-Z]', cleaned):
+                to_translate_indices.append(i)
+                to_translate_texts.append(cleaned)
+            else:
+                chunk_results[i] = text
+                
+        if not to_translate_texts:
+            return start_idx, chunk_results
+            
+        url = "https://translation.googleapis.com/language/translate/v2"
+        params = {"key": api_key}
+        headers = {"Content-Type": "application/json; charset=utf-8"}
+        payload = {
+            "q": to_translate_texts,
+            "target": "zh-CN",
+            "source": "en",
+            "format": "text"
+        }
+        try:
+            response = requests.post(url, params=params, json=payload, headers=headers, timeout=10)
+            if response.status_code == 200:
+                res_data = response.json()
+                translations = res_data.get("data", {}).get("translations", [])
+                for idx, t_idx in enumerate(to_translate_indices):
+                    if idx < len(translations):
+                        translated_val = translations[idx].get("translatedText", "")
+                        chunk_results[t_idx] = html.unescape(translated_val)
+            else:
+                print(f"Google Cloud Translation API error in batch translation: {response.status_code} - {response.text}", file=sys.stderr)
+        except Exception as e:
+            print(f"Google Cloud Translation API exception in batch translation: {str(e)}", file=sys.stderr)
+            
+        return start_idx, chunk_results
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        completed = list(executor.map(translate_chunk_api, zip(chunk_starts, chunks)))
+        
+    for start_idx, chunk_results in completed:
+        for idx, val in enumerate(chunk_results):
+            global_idx = start_idx + idx
+            if global_idx < len(results):
+                results[global_idx] = val
+                
+    return results
+
 def translate_list(texts):
     """
-    Translates a list of texts in parallel in batches of 15 using client=at,
-    falling back to client=gtx, Lingva Translate (pipe-batch), and MyMemory if needed.
+    Translates a list of texts. If GOOGLE_TRANSLATE_API_KEY is available, uses the official API first.
+    Falls back to scraping for any missing or failed items.
     """
     global google_at_blocked, google_gtx_blocked, lingva_blocked, mymemory_blocked
     check_reset_circuit_breakers()
+
+    if not texts:
+        return []
+
+    api_key = os.environ.get("GOOGLE_TRANSLATE_API_KEY")
+    results = [None] * len(texts)
+
+    if api_key:
+        results = translate_list_google_cloud(texts, api_key)
+
+    # Fallback to scraping for any failed or missing items
+    missed_indices = [i for i, r in enumerate(results) if r is None]
+    if missed_indices:
+        missed_texts = [texts[i] for i in missed_indices]
+        fallback_results = translate_list_fallback(missed_texts)
+        for idx, f_res in zip(missed_indices, fallback_results):
+            results[idx] = f_res
+
+    # Fallback to original text for any remaining failures
+    for i in range(len(results)):
+        if results[i] is None:
+            results[i] = texts[i]
+
+    return results
+
+def translate_list_fallback(texts):
+    """
+    Translates a list of texts in parallel in batches of 15 using client=at,
+    falling back to client=gtx, Lingva Translate (pipe-batch), and MyMemory if needed (scraping fallback).
+    """
+    global google_at_blocked, google_gtx_blocked, lingva_blocked, mymemory_blocked
     
     results = [None] * len(texts)
     batch_size = 15
@@ -870,6 +1092,26 @@ def test_apis():
     import requests
     results = {}
     
+    # 0. Google Cloud Translation API (Official)
+    api_key = os.environ.get("GOOGLE_TRANSLATE_API_KEY")
+    if api_key:
+        try:
+            url = "https://translation.googleapis.com/language/translate/v2"
+            params = {"key": api_key}
+            headers = {"Content-Type": "application/json; charset=utf-8"}
+            payload = {
+                "q": ["Hello world"],
+                "target": "zh-CN",
+                "source": "en",
+                "format": "text"
+            }
+            res = requests.post(url, params=params, json=payload, headers=headers, timeout=3)
+            results["google_cloud_api"] = {"status": res.status_code, "text": res.text[:200]}
+        except Exception as e:
+            results["google_cloud_api"] = {"error": str(e)}
+    else:
+        results["google_cloud_api"] = {"status": "not_configured", "message": "GOOGLE_TRANSLATE_API_KEY is not set"}
+        
     # 1. Google AT
     try:
         url = "https://translate.google.com/translate_a/single"
